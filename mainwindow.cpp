@@ -1,6 +1,7 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 
+#include <QComboBox>
 #include <QDesktopServices>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -12,13 +13,19 @@
 #include <QMessageBox>
 #include <QNetworkReply>
 #include <QSettings>
+#include <QStringList>
 #include <QUrl>
 #include <QUrlQuery>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent),
       ui(new Ui::MainWindow),
-      m_stage(Stage::Idle)
+      m_repoRefreshTimer(this),
+      m_stage(Stage::Idle),
+      m_ownerListStage(OwnerListStage::Idle),
+      m_retryRepoListAsUser(false),
+      m_clearRepoTextOnNextRefresh(false),
+      m_clearRepoTextForCurrentRefresh(false)
 {
     ui->setupUi(this);
 
@@ -26,11 +33,20 @@ MainWindow::MainWindow(QWidget *parent)
     ui->progressBar->setRange(0, 100);
     ui->progressBar->setValue(0);
     ui->openReleaseButton->setEnabled(false);
+    m_repoRefreshTimer.setSingleShot(true);
 
     connect(&m_net, &QNetworkAccessManager::finished,
             this, &MainWindow::handleReply);
+    connect(&m_repoRefreshTimer, &QTimer::timeout,
+            this, [this]() { requestRepositoryList(false); });
+    connect(ui->ownerEdit, &QComboBox::currentTextChanged,
+            this, [this]() { scheduleRepositoryRefresh(); });
+    connect(ui->urlEdit, &QComboBox::currentTextChanged,
+            this, [this]() { scheduleRepositoryRefresh(); });
 
     loadSettings();
+    m_lastRepositoryRefreshOwner = currentOwner();
+    scheduleRepositoryRefresh();
 }
 
 MainWindow::~MainWindow()
@@ -42,9 +58,9 @@ MainWindow::~MainWindow()
 void MainWindow::loadSettings()
 {
     QSettings s("OpenAI", "GiteaReleaseUploaderPro");
-    ui->urlEdit->setText(s.value("url", "http://localhost:3000").toString());
-    ui->ownerEdit->setText(s.value("owner").toString());
-    ui->repoEdit->setText(s.value("repo").toString());
+    ui->urlEdit->setEditText(s.value("url", "http://192.168.10.144:3020").toString());
+    ui->ownerEdit->setEditText(s.value("owner", ui->ownerEdit->currentText()).toString());
+    ui->repoEdit->setEditText(s.value("repo").toString());
     ui->tagEdit->setText(s.value("tag").toString());
     ui->titleEdit->setText(s.value("title").toString());
     ui->fileEdit->setText(s.value("file").toString());
@@ -57,9 +73,9 @@ void MainWindow::loadSettings()
 void MainWindow::saveSettings()
 {
     QSettings s("OpenAI", "GiteaReleaseUploaderPro");
-    s.setValue("url", ui->urlEdit->text().trimmed());
-    s.setValue("owner", ui->ownerEdit->text().trimmed());
-    s.setValue("repo", ui->repoEdit->text().trimmed());
+    s.setValue("url", ui->urlEdit->currentText().trimmed());
+    s.setValue("owner", ui->ownerEdit->currentText().trimmed());
+    s.setValue("repo", ui->repoEdit->currentText().trimmed());
     s.setValue("tag", ui->tagEdit->text().trimmed());
     s.setValue("title", ui->titleEdit->text().trimmed());
     s.setValue("file", ui->fileEdit->text().trimmed());
@@ -77,19 +93,34 @@ QString MainWindow::trimTrailingSlash(const QString &s) const
     return out;
 }
 
+QString MainWindow::currentGiteaUrl() const
+{
+    return trimTrailingSlash(ui->urlEdit->currentText());
+}
+
+QString MainWindow::currentOwner() const
+{
+    return ui->ownerEdit->currentText().trimmed();
+}
+
+QString MainWindow::currentRepo() const
+{
+    return ui->repoEdit->currentText().trimmed();
+}
+
 QString MainWindow::baseApiRepoUrl() const
 {
-    return trimTrailingSlash(ui->urlEdit->text()) +
+    return currentGiteaUrl() +
            "/api/v1/repos/" +
-           ui->ownerEdit->text().trimmed() + "/" +
-           ui->repoEdit->text().trimmed();
+           currentOwner() + "/" +
+           currentRepo();
 }
 
 QString MainWindow::releasePageUrl() const
 {
-    return trimTrailingSlash(ui->urlEdit->text()) + "/" +
-           ui->ownerEdit->text().trimmed() + "/" +
-           ui->repoEdit->text().trimmed() + "/releases/tag/" +
+    return currentGiteaUrl() + "/" +
+           currentOwner() + "/" +
+           currentRepo() + "/releases/tag/" +
            ui->tagEdit->text().trimmed();
 }
 
@@ -108,9 +139,9 @@ QString MainWindow::releaseTitleOrFallback() const
 
 bool MainWindow::validateInputs()
 {
-    const QString url = trimTrailingSlash(ui->urlEdit->text());
-    const QString owner = ui->ownerEdit->text().trimmed();
-    const QString repo = ui->repoEdit->text().trimmed();
+    const QString url = currentGiteaUrl();
+    const QString owner = currentOwner();
+    const QString repo = currentRepo();
     const QString tag = ui->tagEdit->text().trimmed();
     const QString token = ui->tokenEdit->text().trimmed();
     const QString file = ui->fileEdit->text().trimmed();
@@ -141,8 +172,10 @@ void MainWindow::setBusy(bool busy)
     ui->openReleaseButton->setEnabled(!busy && !m_releaseHtmlUrl.isEmpty());
     ui->urlEdit->setEnabled(!busy);
     ui->tokenEdit->setEnabled(!busy);
+    ui->refreshOwnersButton->setEnabled(!busy && !m_ownerListReply);
     ui->ownerEdit->setEnabled(!busy);
     ui->repoEdit->setEnabled(!busy);
+    ui->refreshReposButton->setEnabled(!busy && !m_repoListReply);
     ui->tagEdit->setEnabled(!busy);
     ui->titleEdit->setEnabled(!busy);
     ui->fileEdit->setEnabled(!busy);
@@ -178,6 +211,272 @@ void MainWindow::logReplyError(const QString &prefix, QNetworkReply *reply)
     if (!detail.isEmpty())
         text += " / " + detail;
     logMessage(text);
+}
+
+QStringList MainWindow::defaultOwners() const
+{
+    return {
+        "BSP",
+        "Efinix-FPGA",
+        "Product",
+        "Qt-Application",
+        "V71N21-MCU",
+        "V71Q21-MCU",
+        "Xilinx-MCU"
+    };
+}
+
+QString MainWindow::ownerNameFromObject(const QJsonObject &object) const
+{
+    const QString username = object.value("username").toString();
+    if (!username.isEmpty())
+        return username;
+
+    const QString login = object.value("login").toString();
+    if (!login.isEmpty())
+        return login;
+
+    return object.value("name").toString();
+}
+
+void MainWindow::requestOwnerList()
+{
+    const QString url = currentGiteaUrl();
+    if (url.isEmpty())
+        return;
+
+    if (m_ownerListReply) {
+        m_ownerListReply->abort();
+        m_ownerListReply->deleteLater();
+        m_ownerListReply.clear();
+    }
+
+    m_pendingOwners.clear();
+
+    const QString token = ui->tokenEdit->text().trimmed();
+    if (!token.isEmpty())
+        requestOwnerListPath(OwnerListStage::FetchCurrentUser, "/api/v1/user");
+    else
+        requestOwnerListPath(OwnerListStage::FetchPublicOrganizations, "/api/v1/orgs");
+}
+
+void MainWindow::requestOwnerListPath(OwnerListStage stage, const QString &path)
+{
+    const QString url = currentGiteaUrl();
+    if (url.isEmpty())
+        return;
+
+    m_ownerListStage = stage;
+    QNetworkRequest req{QUrl(url + path)};
+    const QString token = ui->tokenEdit->text().trimmed();
+    if (!token.isEmpty())
+        req.setRawHeader("Authorization", ("token " + token).toUtf8());
+
+    ui->refreshOwnersButton->setEnabled(false);
+    QNetworkReply *reply = m_ownerNet.get(req);
+    m_ownerListReply = reply;
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply]() { handleOwnerListReply(reply); });
+}
+
+void MainWindow::handleOwnerListReply(QNetworkReply *reply)
+{
+    if (reply != m_ownerListReply) {
+        reply->deleteLater();
+        return;
+    }
+
+    const QByteArray body = reply->readAll();
+    const QNetworkReply::NetworkError error = reply->error();
+    const QString errorString = reply->errorString();
+    const OwnerListStage stage = m_ownerListStage;
+    m_ownerListStage = OwnerListStage::Idle;
+    m_ownerListReply.clear();
+    reply->deleteLater();
+
+    if (error != QNetworkReply::NoError) {
+        if (stage == OwnerListStage::FetchCurrentUser) {
+            requestOwnerListPath(OwnerListStage::FetchPublicOrganizations, "/api/v1/orgs");
+            return;
+        }
+
+        updateOwnerList(defaultOwners());
+        logMessage("Owner list refresh failed, using defaults: " + errorString);
+        ui->refreshOwnersButton->setEnabled(m_stage == Stage::Idle);
+        return;
+    }
+
+    const QJsonDocument doc = QJsonDocument::fromJson(body);
+    if (stage == OwnerListStage::FetchCurrentUser) {
+        const QString user = ownerNameFromObject(doc.object());
+        if (!user.isEmpty())
+            m_pendingOwners.append(user);
+        requestOwnerListPath(OwnerListStage::FetchUserOrganizations, "/api/v1/user/orgs");
+        return;
+    }
+
+    const QJsonArray array = doc.array();
+    for (const QJsonValue &value : array) {
+        const QString owner = ownerNameFromObject(value.toObject());
+        if (!owner.isEmpty())
+            m_pendingOwners.append(owner);
+    }
+
+    m_pendingOwners.removeDuplicates();
+    m_pendingOwners.sort(Qt::CaseInsensitive);
+    if (m_pendingOwners.isEmpty()) {
+        updateOwnerList(defaultOwners());
+        logMessage("Owner list is empty, using defaults");
+    } else {
+        updateOwnerList(m_pendingOwners);
+        logMessage("Owner list refreshed: " + QString::number(m_pendingOwners.size()));
+    }
+
+    m_pendingOwners.clear();
+    ui->refreshOwnersButton->setEnabled(m_stage == Stage::Idle);
+}
+
+void MainWindow::updateOwnerList(const QStringList &owners)
+{
+    const QString selected = currentOwner();
+    const bool blocked = ui->ownerEdit->blockSignals(true);
+    ui->ownerEdit->clear();
+    ui->ownerEdit->addItems(owners);
+    if (!selected.isEmpty() && owners.contains(selected))
+        ui->ownerEdit->setEditText(selected);
+    else {
+        ui->ownerEdit->setEditText(QString());
+        ui->repoEdit->setEditText(QString());
+    }
+    ui->ownerEdit->blockSignals(blocked);
+
+    m_clearRepoTextOnNextRefresh = true;
+    scheduleRepositoryRefresh();
+}
+
+void MainWindow::scheduleRepositoryRefresh()
+{
+    if (currentGiteaUrl().isEmpty() || currentOwner().isEmpty())
+        return;
+
+    if (!m_lastRepositoryRefreshOwner.isEmpty() &&
+            currentOwner() != m_lastRepositoryRefreshOwner) {
+        m_clearRepoTextOnNextRefresh = true;
+    }
+
+    m_repoRefreshTimer.start(350);
+}
+
+void MainWindow::requestRepositoryList(bool userEndpoint)
+{
+    const QString url = currentGiteaUrl();
+    const QString owner = currentOwner();
+    if (url.isEmpty() || owner.isEmpty())
+        return;
+
+    if (m_repoListReply) {
+        m_repoListReply->abort();
+        m_repoListReply->deleteLater();
+        m_repoListReply.clear();
+    }
+
+    m_retryRepoListAsUser = !userEndpoint;
+    if (!userEndpoint) {
+        m_clearRepoTextForCurrentRefresh = m_clearRepoTextOnNextRefresh ||
+                                           (!m_lastRepositoryRefreshOwner.isEmpty() &&
+                                            owner != m_lastRepositoryRefreshOwner);
+        m_clearRepoTextOnNextRefresh = false;
+    }
+
+    const QString encodedOwner = QString::fromUtf8(QUrl::toPercentEncoding(owner));
+    const QString path = userEndpoint
+                         ? "/api/v1/users/" + encodedOwner + "/repos"
+                         : "/api/v1/orgs/" + encodedOwner + "/repos";
+
+    QNetworkRequest req{QUrl(url + path)};
+    const QString token = ui->tokenEdit->text().trimmed();
+    if (!token.isEmpty())
+        req.setRawHeader("Authorization", ("token " + token).toUtf8());
+
+    ui->refreshReposButton->setEnabled(false);
+    QNetworkReply *reply = m_repoNet.get(req);
+    m_repoListReply = reply;
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply]() { handleRepositoryListReply(reply); });
+}
+
+void MainWindow::handleRepositoryListReply(QNetworkReply *reply)
+{
+    if (reply != m_repoListReply) {
+        reply->deleteLater();
+        return;
+    }
+
+    const QByteArray body = reply->readAll();
+    const QNetworkReply::NetworkError error = reply->error();
+    const QString errorString = reply->errorString();
+    const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    const bool canRetryAsUser = m_retryRepoListAsUser;
+    m_retryRepoListAsUser = false;
+    m_repoListReply.clear();
+    reply->deleteLater();
+
+    if (error != QNetworkReply::NoError) {
+        if (status == 404 && canRetryAsUser) {
+            requestRepositoryList(true);
+            return;
+        }
+
+        QString msg = "Repo list refresh failed: " + errorString;
+        const QString detail = extractBestErrorText(body);
+        if (!detail.isEmpty())
+            msg += " / " + detail;
+        logMessage(msg);
+        ui->refreshReposButton->setEnabled(m_stage == Stage::Idle);
+        return;
+    }
+
+    QStringList repositories;
+    const QJsonDocument doc = QJsonDocument::fromJson(body);
+    const QJsonArray array = doc.array();
+    for (const QJsonValue &value : array) {
+        const QString name = value.toObject().value("name").toString();
+        if (!name.isEmpty())
+            repositories.append(name);
+    }
+
+    repositories.removeDuplicates();
+    repositories.sort(Qt::CaseInsensitive);
+    updateRepositoryList(repositories, m_clearRepoTextForCurrentRefresh);
+    m_clearRepoTextForCurrentRefresh = false;
+    m_lastRepositoryRefreshOwner = currentOwner();
+    logMessage("Repo list refreshed: " + QString::number(repositories.size()));
+    ui->refreshReposButton->setEnabled(m_stage == Stage::Idle);
+}
+
+void MainWindow::updateRepositoryList(const QStringList &repositories, bool clearCurrentText)
+{
+    const QString selected = currentRepo();
+    const bool blocked = ui->repoEdit->blockSignals(true);
+    ui->repoEdit->clear();
+    ui->repoEdit->addItems(repositories);
+    if (clearCurrentText)
+        ui->repoEdit->setEditText(QString());
+    else if (!selected.isEmpty())
+        ui->repoEdit->setEditText(selected);
+    else if (!repositories.isEmpty())
+        ui->repoEdit->setCurrentIndex(0);
+    ui->repoEdit->blockSignals(blocked);
+}
+
+void MainWindow::on_refreshReposButton_clicked()
+{
+    requestRepositoryList(false);
+}
+
+void MainWindow::on_refreshOwnersButton_clicked()
+{
+    requestOwnerList();
 }
 
 void MainWindow::on_browseButton_clicked()
