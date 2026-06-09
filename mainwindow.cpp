@@ -21,11 +21,14 @@ MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent),
       ui(new Ui::MainWindow),
       m_repoRefreshTimer(this),
+      m_tagRefreshTimer(this),
       m_stage(Stage::Idle),
       m_ownerListStage(OwnerListStage::Idle),
       m_retryRepoListAsUser(false),
       m_clearRepoTextOnNextRefresh(false),
-      m_clearRepoTextForCurrentRefresh(false)
+      m_clearRepoTextForCurrentRefresh(false),
+      m_clearTagTextOnNextRefresh(false),
+      m_clearTagTextForCurrentRefresh(false)
 {
     ui->setupUi(this);
 
@@ -34,19 +37,26 @@ MainWindow::MainWindow(QWidget *parent)
     ui->progressBar->setValue(0);
     ui->openReleaseButton->setEnabled(false);
     m_repoRefreshTimer.setSingleShot(true);
+    m_tagRefreshTimer.setSingleShot(true);
 
     connect(&m_net, &QNetworkAccessManager::finished,
             this, &MainWindow::handleReply);
     connect(&m_repoRefreshTimer, &QTimer::timeout,
             this, [this]() { requestRepositoryList(false); });
+    connect(&m_tagRefreshTimer, &QTimer::timeout,
+            this, &MainWindow::requestTagList);
     connect(ui->ownerEdit, &QComboBox::currentTextChanged,
             this, [this]() { scheduleRepositoryRefresh(); });
     connect(ui->urlEdit, &QComboBox::currentTextChanged,
             this, [this]() { scheduleRepositoryRefresh(); });
+    connect(ui->repoEdit, &QComboBox::currentTextChanged,
+            this, [this]() { scheduleTagRefresh(); });
 
     loadSettings();
     m_lastRepositoryRefreshOwner = currentOwner();
+    m_lastTagRefreshRepoKey = currentOwner() + "/" + currentRepo();
     scheduleRepositoryRefresh();
+    scheduleTagRefresh();
 }
 
 MainWindow::~MainWindow()
@@ -61,7 +71,7 @@ void MainWindow::loadSettings()
     ui->urlEdit->setEditText(s.value("url", "http://192.168.10.144:3020").toString());
     ui->ownerEdit->setEditText(s.value("owner", ui->ownerEdit->currentText()).toString());
     ui->repoEdit->setEditText(s.value("repo").toString());
-    ui->tagEdit->setText(s.value("tag").toString());
+    ui->tagEdit->setEditText(s.value("tag").toString());
     ui->titleEdit->setText(s.value("title").toString());
     ui->fileEdit->setText(s.value("file").toString());
     ui->tokenEdit->setText(s.value("token").toString());
@@ -76,7 +86,7 @@ void MainWindow::saveSettings()
     s.setValue("url", ui->urlEdit->currentText().trimmed());
     s.setValue("owner", ui->ownerEdit->currentText().trimmed());
     s.setValue("repo", ui->repoEdit->currentText().trimmed());
-    s.setValue("tag", ui->tagEdit->text().trimmed());
+    s.setValue("tag", ui->tagEdit->currentText().trimmed());
     s.setValue("title", ui->titleEdit->text().trimmed());
     s.setValue("file", ui->fileEdit->text().trimmed());
     s.setValue("token", ui->tokenEdit->text().trimmed());
@@ -108,6 +118,11 @@ QString MainWindow::currentRepo() const
     return ui->repoEdit->currentText().trimmed();
 }
 
+QString MainWindow::currentTag() const
+{
+    return ui->tagEdit->currentText().trimmed();
+}
+
 QString MainWindow::baseApiRepoUrl() const
 {
     return currentGiteaUrl() +
@@ -121,7 +136,7 @@ QString MainWindow::releasePageUrl() const
     return currentGiteaUrl() + "/" +
            currentOwner() + "/" +
            currentRepo() + "/releases/tag/" +
-           ui->tagEdit->text().trimmed();
+           currentTag();
 }
 
 QString MainWindow::fileNameOnly() const
@@ -134,7 +149,7 @@ QString MainWindow::releaseTitleOrFallback() const
     const QString title = ui->titleEdit->text().trimmed();
     if (!title.isEmpty())
         return title;
-    return ui->tagEdit->text().trimmed();
+    return currentTag();
 }
 
 bool MainWindow::validateInputs()
@@ -142,7 +157,7 @@ bool MainWindow::validateInputs()
     const QString url = currentGiteaUrl();
     const QString owner = currentOwner();
     const QString repo = currentRepo();
-    const QString tag = ui->tagEdit->text().trimmed();
+    const QString tag = currentTag();
     const QString token = ui->tokenEdit->text().trimmed();
     const QString file = ui->fileEdit->text().trimmed();
 
@@ -176,7 +191,7 @@ void MainWindow::setBusy(bool busy)
     ui->ownerEdit->setEnabled(!busy);
     ui->repoEdit->setEnabled(!busy);
     ui->refreshReposButton->setEnabled(!busy && !m_repoListReply);
-    ui->tagEdit->setEnabled(!busy);
+    ui->tagEdit->setEnabled(!busy && !m_tagListReply);
     ui->titleEdit->setEnabled(!busy);
     ui->fileEdit->setEnabled(!busy);
     ui->replaceAssetCheck->setEnabled(!busy);
@@ -347,6 +362,7 @@ void MainWindow::updateOwnerList(const QStringList &owners)
     else {
         ui->ownerEdit->setEditText(QString());
         ui->repoEdit->setEditText(QString());
+        updateTagList({}, true);
     }
     ui->ownerEdit->blockSignals(blocked);
 
@@ -365,6 +381,18 @@ void MainWindow::scheduleRepositoryRefresh()
     }
 
     m_repoRefreshTimer.start(350);
+}
+
+void MainWindow::scheduleTagRefresh()
+{
+    const QString repoKey = currentOwner() + "/" + currentRepo();
+    if (currentGiteaUrl().isEmpty() || currentOwner().isEmpty() || currentRepo().isEmpty())
+        return;
+
+    if (!m_lastTagRefreshRepoKey.isEmpty() && repoKey != m_lastTagRefreshRepoKey)
+        m_clearTagTextOnNextRefresh = true;
+
+    m_tagRefreshTimer.start(350);
 }
 
 void MainWindow::requestRepositoryList(bool userEndpoint)
@@ -467,6 +495,100 @@ void MainWindow::updateRepositoryList(const QStringList &repositories, bool clea
     else if (!repositories.isEmpty())
         ui->repoEdit->setCurrentIndex(0);
     ui->repoEdit->blockSignals(blocked);
+
+    if (clearCurrentText)
+        updateTagList({}, true);
+    else
+        scheduleTagRefresh();
+}
+
+void MainWindow::requestTagList()
+{
+    const QString url = currentGiteaUrl();
+    const QString owner = currentOwner();
+    const QString repo = currentRepo();
+    if (url.isEmpty() || owner.isEmpty() || repo.isEmpty())
+        return;
+
+    if (m_tagListReply) {
+        m_tagListReply->abort();
+        m_tagListReply->deleteLater();
+        m_tagListReply.clear();
+    }
+
+    const QString repoKey = owner + "/" + repo;
+    m_clearTagTextForCurrentRefresh = m_clearTagTextOnNextRefresh ||
+                                      (!m_lastTagRefreshRepoKey.isEmpty() &&
+                                       repoKey != m_lastTagRefreshRepoKey);
+    m_clearTagTextOnNextRefresh = false;
+
+    const QString encodedOwner = QString::fromUtf8(QUrl::toPercentEncoding(owner));
+    const QString encodedRepo = QString::fromUtf8(QUrl::toPercentEncoding(repo));
+    QNetworkRequest req{QUrl(url + "/api/v1/repos/" + encodedOwner + "/" + encodedRepo + "/tags")};
+    const QString token = ui->tokenEdit->text().trimmed();
+    if (!token.isEmpty())
+        req.setRawHeader("Authorization", ("token " + token).toUtf8());
+
+    ui->tagEdit->setEnabled(false);
+    QNetworkReply *reply = m_tagNet.get(req);
+    m_tagListReply = reply;
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply]() { handleTagListReply(reply); });
+}
+
+void MainWindow::handleTagListReply(QNetworkReply *reply)
+{
+    if (reply != m_tagListReply) {
+        reply->deleteLater();
+        return;
+    }
+
+    const QByteArray body = reply->readAll();
+    const QNetworkReply::NetworkError error = reply->error();
+    const QString errorString = reply->errorString();
+    m_tagListReply.clear();
+    reply->deleteLater();
+
+    if (error != QNetworkReply::NoError) {
+        if (m_clearTagTextForCurrentRefresh)
+            updateTagList({}, true);
+        m_clearTagTextForCurrentRefresh = false;
+        logMessage("Tag list refresh failed: " + errorString);
+        ui->tagEdit->setEnabled(m_stage == Stage::Idle);
+        return;
+    }
+
+    QStringList tags;
+    const QJsonDocument doc = QJsonDocument::fromJson(body);
+    const QJsonArray array = doc.array();
+    for (const QJsonValue &value : array) {
+        const QString name = value.toObject().value("name").toString();
+        if (!name.isEmpty())
+            tags.append(name);
+    }
+
+    tags.removeDuplicates();
+    tags.sort(Qt::CaseInsensitive);
+    updateTagList(tags, m_clearTagTextForCurrentRefresh);
+    m_clearTagTextForCurrentRefresh = false;
+    m_lastTagRefreshRepoKey = currentOwner() + "/" + currentRepo();
+    logMessage("Tag list refreshed: " + QString::number(tags.size()));
+    ui->tagEdit->setEnabled(m_stage == Stage::Idle);
+}
+
+void MainWindow::updateTagList(const QStringList &tags, bool clearCurrentText)
+{
+    const QString selected = currentTag();
+    const bool blocked = ui->tagEdit->blockSignals(true);
+    ui->tagEdit->clear();
+    ui->tagEdit->addItems(tags);
+    if (clearCurrentText)
+        ui->tagEdit->setEditText(QString());
+    else if (!selected.isEmpty())
+        ui->tagEdit->setEditText(selected);
+    else if (!tags.isEmpty())
+        ui->tagEdit->setCurrentIndex(0);
+    ui->tagEdit->blockSignals(blocked);
 }
 
 void MainWindow::on_refreshReposButton_clicked()
@@ -523,7 +645,7 @@ void MainWindow::startUploadFlow()
 void MainWindow::requestReleaseByTag()
 {
     m_stage = Stage::FetchRelease;
-    const QString url = baseApiRepoUrl() + "/releases/tags/" + ui->tagEdit->text().trimmed();
+    const QString url = baseApiRepoUrl() + "/releases/tags/" + currentTag();
 
     QNetworkRequest req{QUrl(url)};
     req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
@@ -543,7 +665,7 @@ void MainWindow::createRelease()
     req.setRawHeader("Authorization", ("token " + ui->tokenEdit->text().trimmed()).toUtf8());
 
     QJsonObject obj;
-    obj["tag_name"] = ui->tagEdit->text().trimmed();
+    obj["tag_name"] = currentTag();
     obj["name"] = releaseTitleOrFallback();
     obj["body"] = ui->notesEdit->toPlainText();
     obj["draft"] = false;

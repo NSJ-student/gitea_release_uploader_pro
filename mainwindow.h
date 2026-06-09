@@ -60,6 +60,7 @@ private:
     QString currentGiteaUrl() const;
     QString currentOwner() const;
     QString currentRepo() const;
+    QString currentTag() const;
     QString baseApiRepoUrl() const;
     QString releasePageUrl() const;
     QString fileNameOnly() const;
@@ -77,12 +78,16 @@ private:
     void handleUploadReply(QNetworkReply *reply, const QByteArray &body);
     void handleOwnerListReply(QNetworkReply *reply);
     void handleRepositoryListReply(QNetworkReply *reply);
+    void handleTagListReply(QNetworkReply *reply);
     void requestOwnerList();
     void requestOwnerListPath(OwnerListStage stage, const QString &path);
     void requestRepositoryList(bool userEndpoint);
+    void requestTagList();
     void scheduleRepositoryRefresh();
+    void scheduleTagRefresh();
     void updateOwnerList(const QStringList &owners);
     void updateRepositoryList(const QStringList &repositories, bool clearCurrentText);
+    void updateTagList(const QStringList &tags, bool clearCurrentText);
     QStringList defaultOwners() const;
     QString ownerNameFromObject(const QJsonObject &object) const;
 
@@ -95,22 +100,28 @@ private:
     QNetworkAccessManager m_net;
     QNetworkAccessManager m_ownerNet;
     QNetworkAccessManager m_repoNet;
+    QNetworkAccessManager m_tagNet;
     QTimer m_repoRefreshTimer;
+    QTimer m_tagRefreshTimer;
     Stage m_stage;
     OwnerListStage m_ownerListStage;
     bool m_retryRepoListAsUser;
     bool m_clearRepoTextOnNextRefresh;
     bool m_clearRepoTextForCurrentRefresh;
+    bool m_clearTagTextOnNextRefresh;
+    bool m_clearTagTextForCurrentRefresh;
 
     QString m_releaseId;
     QString m_existingAssetId;
     QString m_releaseHtmlUrl;
     QString m_lastRepositoryRefreshOwner;
+    QString m_lastTagRefreshRepoKey;
 
     QPointer<QFile> m_uploadFile;
     QPointer<QHttpMultiPart> m_uploadMultiPart;
     QPointer<QNetworkReply> m_ownerListReply;
     QPointer<QNetworkReply> m_repoListReply;
+    QPointer<QNetworkReply> m_tagListReply;
     QStringList m_pendingOwners;
 };
 
